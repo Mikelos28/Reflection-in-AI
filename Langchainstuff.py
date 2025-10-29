@@ -72,16 +72,17 @@ while True:
         break
 
     reference = get_relevant_context(question)
-    resultg = generative_chain.invoke({"question": question, "reference": reference})
-    resulti = resultg
+    resultg = generative_chain.invoke({"question": question, "reference": reference}) #The llm's initial response
+    resulti = resultg #Temp variable
 
-    for i in range(10):
-        resultr = reflective_chain.invoke({"former_code": resultg})
+    for i in range(4):
+        resultr = reflective_chain.invoke({"former_code": resulti})
         resulti = resultr
 
     print("\n---\nGenerated Answer:\n")
-    print(resultr)
+    print(resultr) #resultr is the variable that holds the llm's answer that has been reflected upon
     print("\n---")
 
     add_to_memory(question, resultr)
+
 
