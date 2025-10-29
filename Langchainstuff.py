@@ -80,9 +80,10 @@ while True:
         resulti = resultr
 
     print("\n---\nGenerated Answer:\n")
-    print(resultr) #resultr is the variable that holds the llm's answer that has been reflected upon
+    print(resultr) #resultr is the variable that holds the llm's answer that has been reflected
     print("\n---")
 
     add_to_memory(question, resultr)
+
 
 
