@@ -76,14 +76,15 @@ while True:
     resultg = generative_chain.invoke({"question": question, "reference": reference}) #The llm's initial response
 
     for i in range(4):
-        resultr = reflective_chain.invoke({"former_code": resultg})
+        resultr = reflective_chain.invoke({"former_code": resultg}) # The reflective agent provides new answer based on the code given from the generative agent
         add_to_memory(question, resultr)
         reference = get_relevant_context(question)
-        resultg = generative_chain.invoke({"question": question, "reference": reference})
+        resultg = generative_chain.invoke({"question": question, "reference": reference}) # Llm's new generation, that uses new feedback
 
     print("\n---\nGenerated Answer:\n")
     print(resultg) #resultg is the variable that holds the llm's answer that has been reflected
     print("\n---")
+
 
 
 
