@@ -18,7 +18,8 @@ text_splitter = RecursiveCharacterTextSplitter(
 template1 = """
 You are a master of coding and can help anyone find errors in their code.
 Your job is to fix the given code, explain it with comments, and also
-generate code based on the user's request.
+generate code based on the user's request. Try to tackle each problem
+by solving it step by step while explaining how you think in every step.
 
 User question:
 {question}
@@ -73,17 +74,17 @@ while True:
 
     reference = get_relevant_context(question)
     resultg = generative_chain.invoke({"question": question, "reference": reference}) #The llm's initial response
-    resulti = resultg #Temp variable
 
     for i in range(4):
-        resultr = reflective_chain.invoke({"former_code": resulti})
-        resulti = resultr
+        resultr = reflective_chain.invoke({"former_code": resultg})
+        add_to_memory(question, resultr)
+        reference = get_relevant_context(question)
+        resultg = generative_chain.invoke({"question": question, "reference": reference})
 
     print("\n---\nGenerated Answer:\n")
-    print(resultr) #resultr is the variable that holds the llm's answer that has been reflected
+    print(resultg) #resultg is the variable that holds the llm's answer that has been reflected
     print("\n---")
 
-    add_to_memory(question, resultr)
 
 
 
