@@ -9,9 +9,7 @@ import tempfile
 import subprocess
 from datasets import load_dataset
 
-# -------------------------------
 # Load the full HumanEval dataset
-# -------------------------------
 dataset = load_dataset("openai/openai_humaneval", split="test")
 
 # Each row in dataset is a dict like:
@@ -23,18 +21,15 @@ dataset = load_dataset("openai/openai_humaneval", split="test")
 #   "entry_point": "function_name" # name of the function to call
 # }
 
-# -------------------------------
+
 # Initialize LLM and vector memory
-# -------------------------------
 model = OllamaLLM(model="gemma3")
 embeddings = OllamaEmbeddings(model="mxbai-embed-large")
 vectorstore = Chroma(collection_name="llm_memory", embedding_function=embeddings, persist_directory="./chroma_db")
 
 text_splitter = RecursiveCharacterTextSplitter(chunk_size=600, chunk_overlap=100)
 
-# -------------------------------
 # Prompt templates
-# -------------------------------
 template1 = """
 You are a master in solving programming problems. You will be given a series of programming problems
 to solve.
@@ -57,27 +52,24 @@ Here is the code the LLM generated before:
 {former_code}  
 """
 
-
-
 generative_prompt = ChatPromptTemplate.from_template(template1)
 generative_chain = generative_prompt | model
 reflective_prompt = ChatPromptTemplate.from_template(template2)
 reflective_chain = reflective_prompt | model
 
-
-
-# -------------------------------
 # Memory helper functions
-# -------------------------------
+# This one adds a question-LLM answer pair for future context in the vector database
 def add_to_memory(question, answer):
     full_text = f"Question: {question}\nAnswer: {answer}"
     chunks = text_splitter.split_text(full_text)
     vectorstore.add_texts(texts=chunks, metadatas=[{"question": question}] * len(chunks))
 
+#This function retrieves context
 def get_relevant_context(question, k=10):
     results = vectorstore.similarity_search(question, k=k)
     return "\n\n".join([r.page_content for r in results])
 
+#This function retrieves the code from the LLM's response
 def extract_code(text):
     # Try fenced blocks first
     fence = re.findall(r"```python(.*?)```", text, re.DOTALL)
@@ -99,9 +91,9 @@ def run_tests(solution_code, test_code):
         f.write(solution_code)
         f.write("\n\n")
         f.write(test_code)
-        f.flush()
+        f.flush() # All text is buffered before we spawn the subprocess
 
-        try:
+        try:    #Try to catch subprocess.TimeoutExpired if process takes too long
             result = subprocess.run(
                 ["python3", f.name],
                 stdout=subprocess.PIPE,
@@ -112,18 +104,17 @@ def run_tests(solution_code, test_code):
         except subprocess.TimeoutExpired:
             return False
 
-# -------------------------------
-# Iterate through HumanEval tasks
-# -------------------------------
-
+# Initializing variables to calculate stats
 correct_solutions = 0
 total_tasks = 0
 
+# Iterate through HumanEval tasks
 for task in dataset:
 
     if total_tasks > 3:  #Used to stop after a certain amount of problems for demonstration purposes
         break            #Remove it to run for all the problems
 
+    #We isolate every value of the current problem
     question = task["prompt"]
     reference_solution = task["canonical_solution"]
     test_code = task["test"]
@@ -154,6 +145,7 @@ success_rate = correct_solutions / total_tasks * 100
 print("--------------") #The llm's success rate on the problems
 print(f"\n\nThe LLM's success rate using reflection is {success_rate:.2f}% ({correct_solutions}/{total_tasks})")
 print("\n--------------")
+
 
 
 
