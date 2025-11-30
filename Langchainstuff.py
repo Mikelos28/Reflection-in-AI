@@ -9,7 +9,6 @@ import tempfile
 import subprocess
 from datasets import load_dataset
 
-
 # Load the full HumanEval dataset
 
 dataset = load_dataset("openai/openai_humaneval", split="test")
@@ -73,11 +72,8 @@ reflective_chain = reflective_prompt | model
 no_reflection_prompt = ChatPromptTemplate.from_template(template3)
 no_reflection_chain = no_reflection_prompt | model
 
-
-
-# -------------------------------
 # Memory helper functions
-# -------------------------------
+
 def add_to_memory(question, answer, taskid):
     full_text = f"Question: {question}\nAnswer: {answer}, taskid: {taskid}"
     chunks = text_splitter.split_text(full_text)
@@ -122,9 +118,7 @@ def run_tests(solution_code, test_code):
         except subprocess.TimeoutExpired:
             return False
 
-# -------------------------------
 # Iterate through HumanEval tasks
-# -------------------------------
 
 correct_solutions = 0
 total_tasks = 0
@@ -164,7 +158,6 @@ for task in dataset:
 
     total_tasks += 1
 
-
 #Calculation of success rate
 success_rate = correct_solutions / total_tasks * 100
 
@@ -202,7 +195,6 @@ print(f"\n\nThe LLM's success rate without using reflection and context is {succ
 print("\n\n---------------\n\n")
 
 #One time reflection agent (case 3)
-
 total_tasks3 = 0
 correct_solutions3 = 0
 
@@ -232,6 +224,7 @@ success_rate3 = correct_solutions3 / total_tasks3 * 100
 print("\n\n--------------\n\n")
 print(f"The result when reflecting once is {success_rate3:.2f}%({correct_solutions3}/{total_tasks3})")
 print("\n\n--------------\n\n")
+
 
 
 
