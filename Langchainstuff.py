@@ -9,7 +9,9 @@ import tempfile
 import subprocess
 from datasets import load_dataset
 
+
 # Load the full HumanEval dataset
+
 dataset = load_dataset("openai/openai_humaneval", split="test")
 
 # Each row in dataset is a dict like:
@@ -21,6 +23,7 @@ dataset = load_dataset("openai/openai_humaneval", split="test")
 #   "entry_point": "function_name" # name of the function to call
 # }
 
+
 # Initialize LLM and vector memory
 
 model = OllamaLLM(model="gemma3")
@@ -29,7 +32,9 @@ vectorstore = Chroma(collection_name="llm_memory", embedding_function=embeddings
 
 text_splitter = RecursiveCharacterTextSplitter(chunk_size=600, chunk_overlap=100)
 
+# -------------------------------
 # Prompt templates
+# -------------------------------
 template1 = """
 You are a master in solving programming problems. You will be given a series of programming problems
 to solve.
@@ -52,12 +57,27 @@ Here is the code the LLM generated before:
 {former_code}  
 """
 
+#Template for problem solving without reflection
+template3 = """  
+You are a master in solving programming problems. You will be given a series of programming problems
+to solve.
+
+User question:
+{question}
+"""
+
 generative_prompt = ChatPromptTemplate.from_template(template1)
 generative_chain = generative_prompt | model
 reflective_prompt = ChatPromptTemplate.from_template(template2)
 reflective_chain = reflective_prompt | model
+no_reflection_prompt = ChatPromptTemplate.from_template(template3)
+no_reflection_chain = no_reflection_prompt | model
 
+
+
+# -------------------------------
 # Memory helper functions
+# -------------------------------
 def add_to_memory(question, answer, taskid):
     full_text = f"Question: {question}\nAnswer: {answer}, taskid: {taskid}"
     chunks = text_splitter.split_text(full_text)
@@ -101,14 +121,19 @@ def run_tests(solution_code, test_code):
             return result.returncode == 0
         except subprocess.TimeoutExpired:
             return False
-            
+
+# -------------------------------
 # Iterate through HumanEval tasks
+# -------------------------------
+
 correct_solutions = 0
 total_tasks = 0
+no_of_loops = 0 #The total number of loops used to reach the result in the end
 
+# Reflection Loop (case 1)
 for task in dataset:
 
-    if total_tasks > 3:  #Used to stop after a certain amount of problems for demonstration purposes
+    if total_tasks > 20:  #Used to stop after a certain amount of problems for demonstration purposes
         break            #Remove it to run for all the problems
 
     question = task["prompt"]
@@ -116,35 +141,98 @@ for task in dataset:
     test_code = task["test"]
     entry_point = task["entry_point"]
 
+    #Short term memory
+    short_term = []
+
     print(f"\n Currently solving: {task['task_id']} ({entry_point})") # The problem we are currently at
 
     reference = get_relevant_context(question) # Gets context (if it exists)
-    resultg = generative_chain.invoke({"question": question, "reference": reference}) #Llm's initial response
+    resultg = generative_chain.invoke({"question": question, "reference": short_term}) #Llm's initial response
 
-    # Reflection loop
-    for i in range(2):
-        resultr = reflective_chain.invoke({"former_code": resultg}) #Reflection analysis
-        add_to_memory(question, resultr, total_tasks) #Adds the pair of question and the llm's reflection on it
-        reference = get_relevant_context(question) #Gets new context again
-        resultg = generative_chain.invoke({"question": question, "reference": reference}) #The generative agent produces a new answer
+    # Loop
+    for i in range(10):
+        solution_code = extract_code(resultg)  # Get the code from the llm's response
+        is_correct = run_tests(solution_code, test_code)  # Run the llm's response as a subprocess
+        if is_correct:
+            correct_solutions += 1
+            break
+        resultr = reflective_chain.invoke({"former_code": solution_code}) #Reflection analysis
+        short_term.append({"context": resultr})
+        resultg = generative_chain.invoke({"question": question, "reference": short_term}) #The generative agent produces a new answer
+        no_of_loops += 1
 
-    solution_code = extract_code(resultg) #Get the code from the llm's response
-    is_correct = run_tests(solution_code, test_code) # Run the llm's response as a subprocess
-    if is_correct:
-        correct_solutions += 1
 
     total_tasks += 1
 
-    if len(vectorstore.get()['ids']) > 50:
-        oldest_id = vectorstore.get()['ids'][0]
-        vectorstore.delete(ids=[oldest_id])
 
 #Calculation of success rate
 success_rate = correct_solutions / total_tasks * 100
 
 print("--------------") #The llm's success rate on the problems
-print(f"\n\nThe LLM's success rate using reflection is {success_rate:.2f}% ({correct_solutions}/{total_tasks})")
-print("\n--------------")
+print(f"\n\nThe LLM's success rate using reflection is {success_rate:.2f}% ({correct_solutions}/{total_tasks})\n\n")
+print(f"The number of refletion loops to get these results was {no_of_loops}")
+print("\n--------------\n\n\n")
+
+
+total_tasks2 = 0
+correct_solutions2 = 0
+
+#Asking the llm to solve a problem without reflection/context (case 2)
+for task in dataset:
+
+    if total_tasks2 > 20:  #Used to stop after a certain amount of problems for demonstration purposes
+        break            #Remove it to run for all the problems
+
+    question = task["prompt"]
+    reference_solution = task["canonical_solution"]
+    test_code = task["test"]
+    entry_point = task["entry_point"]
+
+    print(f"\n Currently solving: {task['task_id']} ({entry_point})")  # The problem we are currently at
+    resultg = no_reflection_chain.invoke({"question": question})  # Llm's initial response
+    solution_code = extract_code(resultg)  # Get the code from the llm's response
+    is_correct = run_tests(solution_code, test_code)  # Run the llm's response as a subprocess
+    if is_correct:
+        correct_solutions2 += 1
+    total_tasks2 += 1
+
+success_rate2 = correct_solutions2 / total_tasks2 * 100
+print("\n-----------")
+print(f"\n\nThe LLM's success rate without using reflection and context is {success_rate2:.2f}% ({correct_solutions2}/{total_tasks2})\n\n")
+print("\n\n---------------\n\n")
+
+#One time reflection agent (case 3)
+
+total_tasks3 = 0
+correct_solutions3 = 0
+
+for task in dataset:
+
+    if total_tasks3 > 20:
+        break
+
+    question = task["prompt"]
+    reference_solution = task["canonical_solution"]
+    test_code = task["test"]
+    entry_point = task["entry_point"]
+
+    print(f"\n Currently solving: {task['task_id']} ({entry_point})")
+    resultg = no_reflection_chain.invoke({"question": question})
+    initcode = extract_code(resultg)
+    resultr = reflective_chain.invoke({"former_code": initcode})
+    resultg = generative_chain.invoke({"question": question, "reference": resultr})
+
+    solution_code = extract_code(resultg)
+    is_correct = run_tests(solution_code, test_code)
+    if is_correct:
+        correct_solutions3 += 1
+    total_tasks3 += 1
+
+success_rate3 = correct_solutions3 / total_tasks3 * 100
+print("\n\n--------------\n\n")
+print(f"The result when reflecting once is {success_rate3:.2f}%({correct_solutions3}/{total_tasks3})")
+print("\n\n--------------\n\n")
+
 
 
 
