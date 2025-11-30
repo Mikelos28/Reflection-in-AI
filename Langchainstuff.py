@@ -9,9 +9,7 @@ import tempfile
 import subprocess
 from datasets import load_dataset
 
-
 # Load the full HumanEval dataset
-
 dataset = load_dataset("openai/openai_humaneval", split="test")
 
 # Each row in dataset is a dict like:
@@ -23,7 +21,6 @@ dataset = load_dataset("openai/openai_humaneval", split="test")
 #   "entry_point": "function_name" # name of the function to call
 # }
 
-
 # Initialize LLM and vector memory
 
 model = OllamaLLM(model="gemma3")
@@ -32,9 +29,7 @@ vectorstore = Chroma(collection_name="llm_memory", embedding_function=embeddings
 
 text_splitter = RecursiveCharacterTextSplitter(chunk_size=600, chunk_overlap=100)
 
-# -------------------------------
 # Prompt templates
-# -------------------------------
 template1 = """
 You are a master in solving programming problems. You will be given a series of programming problems
 to solve.
@@ -57,18 +52,12 @@ Here is the code the LLM generated before:
 {former_code}  
 """
 
-
-
 generative_prompt = ChatPromptTemplate.from_template(template1)
 generative_chain = generative_prompt | model
 reflective_prompt = ChatPromptTemplate.from_template(template2)
 reflective_chain = reflective_prompt | model
 
-
-
-# -------------------------------
 # Memory helper functions
-# -------------------------------
 def add_to_memory(question, answer, taskid):
     full_text = f"Question: {question}\nAnswer: {answer}, taskid: {taskid}"
     chunks = text_splitter.split_text(full_text)
@@ -112,11 +101,8 @@ def run_tests(solution_code, test_code):
             return result.returncode == 0
         except subprocess.TimeoutExpired:
             return False
-
-# -------------------------------
+            
 # Iterate through HumanEval tasks
-# -------------------------------
-
 correct_solutions = 0
 total_tasks = 0
 
@@ -159,6 +145,7 @@ success_rate = correct_solutions / total_tasks * 100
 print("--------------") #The llm's success rate on the problems
 print(f"\n\nThe LLM's success rate using reflection is {success_rate:.2f}% ({correct_solutions}/{total_tasks})")
 print("\n--------------")
+
 
 
 
