@@ -3,13 +3,15 @@ from langchain_ollama import OllamaLLM
 from langchain_community.vectorstores import Chroma
 from langchain_community.embeddings import OllamaEmbeddings
 from langchain.text_splitter import RecursiveCharacterTextSplitter
-from datasets import load_dataset
+from chromadb.config import Settings
 import re
 import tempfile
 import subprocess
 from datasets import load_dataset
 
+
 # Load the full HumanEval dataset
+
 dataset = load_dataset("openai/openai_humaneval", split="test")
 
 # Each row in dataset is a dict like:
@@ -23,13 +25,16 @@ dataset = load_dataset("openai/openai_humaneval", split="test")
 
 
 # Initialize LLM and vector memory
+
 model = OllamaLLM(model="gemma3")
 embeddings = OllamaEmbeddings(model="mxbai-embed-large")
 vectorstore = Chroma(collection_name="llm_memory", embedding_function=embeddings, persist_directory="./chroma_db")
 
 text_splitter = RecursiveCharacterTextSplitter(chunk_size=600, chunk_overlap=100)
 
+# -------------------------------
 # Prompt templates
+# -------------------------------
 template1 = """
 You are a master in solving programming problems. You will be given a series of programming problems
 to solve.
@@ -52,24 +57,28 @@ Here is the code the LLM generated before:
 {former_code}  
 """
 
+
+
 generative_prompt = ChatPromptTemplate.from_template(template1)
 generative_chain = generative_prompt | model
 reflective_prompt = ChatPromptTemplate.from_template(template2)
 reflective_chain = reflective_prompt | model
 
-# Memory helper functions
-# This one adds a question-LLM answer pair for future context in the vector database
-def add_to_memory(question, answer):
-    full_text = f"Question: {question}\nAnswer: {answer}"
-    chunks = text_splitter.split_text(full_text)
-    vectorstore.add_texts(texts=chunks, metadatas=[{"question": question}] * len(chunks))
 
-#This function retrieves context
+
+# -------------------------------
+# Memory helper functions
+# -------------------------------
+def add_to_memory(question, answer, taskid):
+    full_text = f"Question: {question}\nAnswer: {answer}, taskid: {taskid}"
+    chunks = text_splitter.split_text(full_text)
+    ids = [f"{taskid}_{i}" for i in range(len(chunks))]
+    vectorstore.add_texts(texts=chunks, metadatas=[{"question": question}] * len(chunks), ids=ids)
+
 def get_relevant_context(question, k=10):
     results = vectorstore.similarity_search(question, k=k)
     return "\n\n".join([r.page_content for r in results])
 
-#This function retrieves the code from the LLM's response
 def extract_code(text):
     # Try fenced blocks first
     fence = re.findall(r"```python(.*?)```", text, re.DOTALL)
@@ -91,9 +100,9 @@ def run_tests(solution_code, test_code):
         f.write(solution_code)
         f.write("\n\n")
         f.write(test_code)
-        f.flush() # All text is buffered before we spawn the subprocess
+        f.flush()
 
-        try:    #Try to catch subprocess.TimeoutExpired if process takes too long
+        try:
             result = subprocess.run(
                 ["python3", f.name],
                 stdout=subprocess.PIPE,
@@ -104,17 +113,18 @@ def run_tests(solution_code, test_code):
         except subprocess.TimeoutExpired:
             return False
 
-# Initializing variables to calculate stats
+# -------------------------------
+# Iterate through HumanEval tasks
+# -------------------------------
+
 correct_solutions = 0
 total_tasks = 0
 
-# Iterate through HumanEval tasks
 for task in dataset:
 
     if total_tasks > 3:  #Used to stop after a certain amount of problems for demonstration purposes
         break            #Remove it to run for all the problems
 
-    #We isolate every value of the current problem
     question = task["prompt"]
     reference_solution = task["canonical_solution"]
     test_code = task["test"]
@@ -128,7 +138,7 @@ for task in dataset:
     # Reflection loop
     for i in range(2):
         resultr = reflective_chain.invoke({"former_code": resultg}) #Reflection analysis
-        add_to_memory(question, resultr) #Adds the pair of question and the llm's reflection on it
+        add_to_memory(question, resultr, total_tasks) #Adds the pair of question and the llm's reflection on it
         reference = get_relevant_context(question) #Gets new context again
         resultg = generative_chain.invoke({"question": question, "reference": reference}) #The generative agent produces a new answer
 
@@ -139,12 +149,17 @@ for task in dataset:
 
     total_tasks += 1
 
+    if len(vectorstore.get()['ids']) > 50:
+        oldest_id = vectorstore.get()['ids'][0]
+        vectorstore.delete(ids=[oldest_id])
+
 #Calculation of success rate
 success_rate = correct_solutions / total_tasks * 100
 
 print("--------------") #The llm's success rate on the problems
 print(f"\n\nThe LLM's success rate using reflection is {success_rate:.2f}% ({correct_solutions}/{total_tasks})")
 print("\n--------------")
+
 
 
 
