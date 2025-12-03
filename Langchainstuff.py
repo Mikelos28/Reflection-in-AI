@@ -9,7 +9,6 @@ import tempfile
 import subprocess
 from datasets import load_dataset
 
-
 # Load the full HumanEval dataset
 
 dataset = load_dataset("openai/openai_humaneval", split="test")
@@ -22,7 +21,6 @@ dataset = load_dataset("openai/openai_humaneval", split="test")
 #   "test": "...",                 # test code to evaluate solution
 #   "entry_point": "function_name" # name of the function to call
 # }
-
 
 # Initialize LLM and vector memory
 
@@ -971,6 +969,7 @@ print("\n\n--------------\n\n")
 print(f"The final agent managed to solve {success_rate3}({correct_solutions3}/{total_tasks3}) of the problems not solved in the previous step\n\n")
 print(f"Number of loops used by the agent in this step: {no_of_loops}\n\n")
 print("\n\n--------------\n\n")
+
 
 
 
