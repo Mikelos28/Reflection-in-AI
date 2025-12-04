@@ -8,21 +8,9 @@ import re
 import tempfile
 import subprocess
 from datasets import load_dataset
-
-# Load the full HumanEval dataset
+import os
 
 dataset = load_dataset("openai/openai_humaneval", split="test")
-
-# Each row in dataset is a dict like:
-# {
-#   "task_id": "HumanEval/0",
-#   "prompt": "...",               # problem statement and function signature
-#   "canonical_solution": "...",   # correct reference code
-#   "test": "...",                 # test code to evaluate solution
-#   "entry_point": "function_name" # name of the function to call
-# }
-
-# Initialize LLM and vector memory
 
 model = OllamaLLM(model="gemma3")
 embeddings = OllamaEmbeddings(model="mxbai-embed-large")
@@ -30,12 +18,11 @@ vectorstore = Chroma(collection_name="llm_memory", embedding_function=embeddings
 
 text_splitter = RecursiveCharacterTextSplitter(chunk_size=600, chunk_overlap=100)
 
-# -------------------------------
 # Prompt templates
-# -------------------------------
 template1 = """
-You are a master in solving programming problems. You will be given a series of programming problems
+You are a programmer. You will be given a series of programming problems
 to solve and you will have to generate the code needed to solve the problem.
+Try to think about it step by step before concluding and generating the code
 
 User question:
 {question}
@@ -44,21 +31,31 @@ Relevant past answers:
 {reference}
 """
 
+# Reflection template now receives stdout/stderr and former_code to analyze
 template2 = """
-Follow these steps:  
-Step 1: Imagine you are reviewing this code as a senior engineer.  
-    - What would you critique or suggest improving?  
-    - Are there bugs, inefficiencies, or design flaws? 
-Step 2: Write down your suggestions for improvement.
+Follow these steps:
+Step 1: Imagine you are reviewing this code as a senior engineer.
+    - What would you critique or suggest improving?
+    - Are there bugs, inefficiencies, or design flaws?
+    - Use the test output and errors to locate the bug(s).
+
+Step 2: Write down your suggestions for improvement and propose a corrected code snippet.
 
 Here is the code the LLM generated before:
-{former_code}  
+{former_code}
+
+Test stdout:
+{stdout}
+
+Test stderr:
+{stderr}
 """
 
-#Template for problem solving without reflection
-template3 = """  
-You are a master in solving programming problems. You will be given a series of programming problems
-to solve and you will have to generate the code needed to solve the problem.
+# simple solver prompt
+template3 = """
+You are a programmer expert in solving programming problems. You will be given a series of programming problems
+to solve and you will have to generate the code needed to solve the problem. Try to think about it step by step
+and explain what you're doing before concluding by generating the code.
 
 User question:
 {question}
@@ -72,10 +69,20 @@ no_reflection_prompt = ChatPromptTemplate.from_template(template3)
 no_reflection_chain = no_reflection_prompt | model
 
 
+# Helpers (extract_code, memory)
 
-# -------------------------------
-# Memory helper functions
-# -------------------------------
+def extract_code(text):
+    # Try fenced python blocks first
+    fence = re.findall(r"```python(.*?)```", text, re.DOTALL)
+    if fence:
+        return fence[0].strip()
+    # Try generic fences
+    fence = re.findall(r"```(.*?)```", text, re.DOTALL)
+    if fence:
+        return fence[0].strip()
+    # Fallback: return whole text
+    return text.strip()
+
 def add_to_memory(question, answer, taskid):
     full_text = f"Question: {question}\nAnswer: {answer}, taskid: {taskid}"
     chunks = text_splitter.split_text(full_text)
@@ -86,889 +93,247 @@ def get_relevant_context(question, k=10):
     results = vectorstore.similarity_search(question, k=k)
     return "\n\n".join([r.page_content for r in results])
 
-def extract_code(text):
-    # Try fenced blocks first
-    fence = re.findall(r"```python(.*?)```", text, re.DOTALL)
-    if fence:
-        return fence[0].strip()
+# run_tests: return stdout/stderr and result
 
-    # Try generic fences
-    fence = re.findall(r"```(.*?)```", text, re.DOTALL)
-    if fence:
-        return fence[0].strip()
-
-    # Fallback: return whole text
-    return text.strip()
-
-def run_tests(solution_code, test_code):
-    # Create a safe temp file
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
-        # Write user's solution + tests
+def run_tests(solution_code, test_code, timeout_seconds=5):
+    # Create temp file and write solution + tests
+    with tempfile.NamedTemporaryFile(
+        mode="w",
+        suffix=".py",
+        delete=False,
+        encoding="utf-8"
+    ) as f:
+        fname = f.name
         f.write(solution_code)
         f.write("\n\n")
         f.write(test_code)
         f.flush()
 
+    try:
+        result = subprocess.run(
+            ["python3", fname],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=timeout_seconds,
+            text=True,  # ensures stdout/stderr are strings
+        )
+        return {
+            "passed": result.returncode == 0,
+            "stdout": result.stdout,
+            "stderr": result.stderr,
+            "returncode": result.returncode,
+        }
+
+    except subprocess.TimeoutExpired:
+        return {
+            "passed": False,
+            "stdout": "",
+            "stderr": f"TimeoutExpired: Code execution exceeded {timeout_seconds} seconds.",
+            "returncode": None,
+        }
+
+    finally:
+        # cleanup temp file if it still exists
         try:
-            result = subprocess.run(
-                ["python3", f.name],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                timeout=5,
-            )
-            return result.returncode == 0
-        except subprocess.TimeoutExpired:
-            return False
+            if os.path.exists(fname):
+                os.remove(fname)
+        except Exception:
+            pass
 
-# -------------------------------
-# Iterate through HumanEval tasks
-# -------------------------------
 
+# Main evaluation loops (refactor)
 total_tasks = 0
 correct_solutions = 0
-false_tasks = []
-tasks_not_solved = 0
-#Asking the llm to solve a problem without reflection/context (step 1)
+false_tasks = []           
+memo = {}                  # map task_id -> {"answer": <llm output>, "stdout":..., "stderr":...}
+
+# Step 1: initial generation without reflection
 for task in dataset:
 
-    if total_tasks > 70:
-        break
-
+    task_id = task["task_id"]
     question = task["prompt"]
-    reference_solution = task["canonical_solution"]
     test_code = task["test"]
     entry_point = task["entry_point"]
 
-    print(f"\n Currently solving: {task['task_id']} ({entry_point})")  # The problem we are currently at
-    resultg = no_reflection_chain.invoke({"question": question})  # Llm's initial response
-    solution_code = extract_code(resultg)  # Get the code from the llm's response
-    is_correct = run_tests(solution_code, test_code)  # Run the llm's response as a subprocess
-    if is_correct:
+    print(f"\n Currently solving: {task_id} ({entry_point})")
+    llm_response = no_reflection_chain.invoke({"question": question})
+    solution_code = extract_code(llm_response)
+
+    test_result = run_tests(solution_code, test_code)
+    if test_result["passed"]:
         correct_solutions += 1
     else:
-        false_tasks.append(task["task_id"])
-        tasks_not_solved += 1
+        false_tasks.append(task_id)
+        memo[task_id] = {
+            "answer": llm_response,
+            "solution_code": solution_code,
+            "stdout": test_result["stdout"],
+            "stderr": test_result["stderr"],
+        }
     total_tasks += 1
 
-success_rate = correct_solutions / total_tasks * 100
+success_rate = correct_solutions / total_tasks * 100 if total_tasks else 0.0
 print("\n-----------")
 print(f"\n\nThe LLM's success rate without using reflection and context is {success_rate:.2f}% ({correct_solutions}/{total_tasks})\n\n")
 print("Any unsolved tasks from this step, will be taken to the one time reflection agent")
 print("\n\n---------------\n\n")
 
-#One time reflection agent (step 2)
-
+# Step 2: one-time reflection
 total_tasks2 = 0
 correct_solutions2 = 0
+memo_1_reflection = {}  # map task_id -> latest failed llm response
 
 for task in dataset:
-
-    if total_tasks2 < 70 or false_tasks == []:
+    if not false_tasks:
         break
 
+    task_id = task["task_id"]
+    if task_id not in false_tasks:
+        continue
+
     question = task["prompt"]
-    reference_solution = task["canonical_solution"]
     test_code = task["test"]
     entry_point = task["entry_point"]
 
-    for j in false_tasks:
-        if task["task_id"] == j:
-            print(f"\n Currently solving: {task['task_id']} ({entry_point})")
-            resultg = no_reflection_chain.invoke({"question": question})
-            initcode = extract_code(resultg)
-            resultr = reflective_chain.invoke({"former_code": initcode})
-            resultg = generative_chain.invoke({"question": question, "reference": resultr})
+    print(f"\n Currently solving (one-time reflection): {task_id} ({entry_point})")
 
-            solution_code = extract_code(resultg)
-            is_correct = run_tests(solution_code, test_code)
-            if is_correct:
-                correct_solutions2 += 1
-                false_tasks.pop(j)
+    # previous answer + logs
+    prev = memo[task_id]
+    prev_answer = prev["answer"]
+    prev_code = prev["solution_code"]
+    prev_stdout = prev["stdout"]
+    prev_stderr = prev["stderr"]
 
-            total_tasks2 += 1
-        else:
-            continue
+    # Ask generative chain with reference to previous answer
+    gen_resp = generative_chain.invoke({"question": question, "reference": prev_answer})
+    init_code = extract_code(gen_resp)
 
-success_rate2 = correct_solutions2 / total_tasks2 * 100
-print("\n\n--------------\n\n")
-print(f"The one time reflection agent manages to solve {success_rate2:.2f}%({correct_solutions2}/{total_tasks2}) of the problems not solved in the previous step\n\n")
-print("What problems remain unsolved will be solved by the reflection loop agent")
-print("\n\n--------------\n\n")
+    # Run tests on init_code to obtain real logs
+    init_result = run_tests(init_code, test_code)
+    if init_result["passed"]:
+        correct_solutions2 += 1
+        # mark solved: remove from false_tasks and update memo
+        false_tasks.remove(task_id)
+        memo[task_id] = {"answer": gen_resp, "solution_code": init_code, "stdout": init_result["stdout"], "stderr": init_result["stderr"]}
+        total_tasks2 += 1
+        continue
 
-total_tasks3 = 0
-correct_solutions3 = 0
-no_of_loops = 0
+    # Give logs to the reflective agent
+    reflection = reflective_chain.invoke({
+        "former_code": init_code,
+        "stdout": init_result["stdout"],
+        "stderr": init_result["stderr"],
+    })
 
-# Reflection Loop (step 3)
-for task in dataset:
+    # Use reflection as reference to generate a corrected solution
+    gen_after_reflect = generative_chain.invoke({"question": question, "reference": reflection})
+    corrected_code = extract_code(gen_after_reflect)
+    corrected_result = run_tests(corrected_code, test_code)
 
-    if total_tasks3 > 70 or false_tasks == []:
-        break
-
-    question = task["prompt"]
-    reference_solution = task["canonical_solution"]
-    test_code = task["test"]
-    entry_point = task["entry_point"]
-
-    #Short term memory
-    short_term = []
-
-    for k in false_tasks:
-        if task["task_id"] == k:
-            print(f"\n Currently solving: {task['task_id']} ({entry_point})")  # The problem we are currently at
-
-            resultg = generative_chain.invoke({"question": question, "reference": short_term})  # Llm's initial response
-
-            # Loop
-            for i in range(10):
-                solution_code = extract_code(resultg)  # Get the code from the llm's response
-                is_correct = run_tests(solution_code, test_code)  # Run the llm's response as a subprocess
-                if is_correct:
-                    correct_solutions3 += 1
-                    break
-                resultr = reflective_chain.invoke({"former_code": solution_code})  # Reflection analysis
-                no_of_loops += 1
-                short_term.append({"context": resultr})
-                resultg = generative_chain.invoke( {"question": question, "reference": short_term})  # The generative agent produces a new answer
-
-            total_tasks3 += 1
-        else:
-            continue
-
-success_rate3 = correct_solutions3 / total_tasks3 * 100
-print("\n\n--------------\n\n")
-print(f"The final agent managed to solve {success_rate3}({correct_solutions3}/{total_tasks3}) of the problems not solved in the previous step\n\n")
-print(f"Number of loops used by the agent in this step: {no_of_loops}\n\n")
-print("\n\n--------------\n\n")from langchain_core.prompts import ChatPromptTemplate
-from langchain_ollama import OllamaLLM
-from langchain_community.vectorstores import Chroma
-from langchain_community.embeddings import OllamaEmbeddings
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from chromadb.config import Settings
-import re
-import tempfile
-import subprocess
-from datasets import load_dataset
-
-
-# Load the full HumanEval dataset
-
-dataset = load_dataset("openai/openai_humaneval", split="test")
-
-# Each row in dataset is a dict like:
-# {
-#   "task_id": "HumanEval/0",
-#   "prompt": "...",               # problem statement and function signature
-#   "canonical_solution": "...",   # correct reference code
-#   "test": "...",                 # test code to evaluate solution
-#   "entry_point": "function_name" # name of the function to call
-# }
-
-
-# Initialize LLM and vector memory
-
-model = OllamaLLM(model="gemma3")
-embeddings = OllamaEmbeddings(model="mxbai-embed-large")
-vectorstore = Chroma(collection_name="llm_memory", embedding_function=embeddings, persist_directory="./chroma_db")
-
-text_splitter = RecursiveCharacterTextSplitter(chunk_size=600, chunk_overlap=100)
-
-# -------------------------------
-# Prompt templates
-# -------------------------------
-template1 = """
-You are a master in solving programming problems. You will be given a series of programming problems
-to solve and you will have to generate the code needed to solve the problem.
-
-User question:
-{question}
-
-Relevant past answers:
-{reference}
-"""
-
-template2 = """
-Follow these steps:  
-Step 1: Imagine you are reviewing this code as a senior engineer.  
-    - What would you critique or suggest improving?  
-    - Are there bugs, inefficiencies, or design flaws? 
-Step 2: Write down your suggestions for improvement.
-
-Here is the code the LLM generated before:
-{former_code}  
-"""
-
-#Template for problem solving without reflection
-template3 = """  
-You are a master in solving programming problems. You will be given a series of programming problems
-to solve and you will have to generate the code needed to solve the problem.
-
-User question:
-{question}
-"""
-
-generative_prompt = ChatPromptTemplate.from_template(template1)
-generative_chain = generative_prompt | model
-reflective_prompt = ChatPromptTemplate.from_template(template2)
-reflective_chain = reflective_prompt | model
-no_reflection_prompt = ChatPromptTemplate.from_template(template3)
-no_reflection_chain = no_reflection_prompt | model
-
-
-
-# -------------------------------
-# Memory helper functions
-# -------------------------------
-def add_to_memory(question, answer, taskid):
-    full_text = f"Question: {question}\nAnswer: {answer}, taskid: {taskid}"
-    chunks = text_splitter.split_text(full_text)
-    ids = [f"{taskid}_{i}" for i in range(len(chunks))]
-    vectorstore.add_texts(texts=chunks, metadatas=[{"question": question}] * len(chunks), ids=ids)
-
-def get_relevant_context(question, k=10):
-    results = vectorstore.similarity_search(question, k=k)
-    return "\n\n".join([r.page_content for r in results])
-
-def extract_code(text):
-    # Try fenced blocks first
-    fence = re.findall(r"```python(.*?)```", text, re.DOTALL)
-    if fence:
-        return fence[0].strip()
-
-    # Try generic fences
-    fence = re.findall(r"```(.*?)```", text, re.DOTALL)
-    if fence:
-        return fence[0].strip()
-
-    # Fallback: return whole text
-    return text.strip()
-
-def run_tests(solution_code, test_code):
-    # Create a safe temp file
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
-        # Write user's solution + tests
-        f.write(solution_code)
-        f.write("\n\n")
-        f.write(test_code)
-        f.flush()
-
-        try:
-            result = subprocess.run(
-                ["python3", f.name],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                timeout=5,
-            )
-            return result.returncode == 0
-        except subprocess.TimeoutExpired:
-            return False
-
-# -------------------------------
-# Iterate through HumanEval tasks
-# -------------------------------
-
-total_tasks = 0
-correct_solutions = 0
-false_tasks = []
-tasks_not_solved = 0
-#Asking the llm to solve a problem without reflection/context (step 1)
-for task in dataset:
-
-    if total_tasks > 70:
-        break
-
-    question = task["prompt"]
-    reference_solution = task["canonical_solution"]
-    test_code = task["test"]
-    entry_point = task["entry_point"]
-
-    print(f"\n Currently solving: {task['task_id']} ({entry_point})")  # The problem we are currently at
-    resultg = no_reflection_chain.invoke({"question": question})  # Llm's initial response
-    solution_code = extract_code(resultg)  # Get the code from the llm's response
-    is_correct = run_tests(solution_code, test_code)  # Run the llm's response as a subprocess
-    if is_correct:
-        correct_solutions += 1
+    if corrected_result["passed"]:
+        correct_solutions2 += 1
+        if task_id in false_tasks:
+            false_tasks.remove(task_id)
+        memo[task_id] = {"answer": gen_after_reflect, "solution_code": corrected_code, "stdout": corrected_result["stdout"], "stderr": corrected_result["stderr"]}
     else:
-        false_tasks.append(task["task_id"])
-        tasks_not_solved += 1
-    total_tasks += 1
+        # still failing, keep for the reflection loop step
+        memo_1_reflection[task_id] = {
+            "answer": gen_after_reflect,
+            "solution_code": corrected_code,
+            "stdout": corrected_result["stdout"],
+            "stderr": corrected_result["stderr"],
+        }
 
-success_rate = correct_solutions / total_tasks * 100
-print("\n-----------")
-print(f"\n\nThe LLM's success rate without using reflection and context is {success_rate:.2f}% ({correct_solutions}/{total_tasks})\n\n")
-print("Any unsolved tasks from this step, will be taken to the one time reflection agent")
-print("\n\n---------------\n\n")
+    total_tasks2 += 1
 
-#One time reflection agent (step 2)
-
-total_tasks2 = 0
-correct_solutions2 = 0
-
-for task in dataset:
-
-    if total_tasks2 < 70 or false_tasks == []:
-        break
-
-    question = task["prompt"]
-    reference_solution = task["canonical_solution"]
-    test_code = task["test"]
-    entry_point = task["entry_point"]
-
-    for j in false_tasks:
-        if task["task_id"] == j:
-            print(f"\n Currently solving: {task['task_id']} ({entry_point})")
-            resultg = no_reflection_chain.invoke({"question": question})
-            initcode = extract_code(resultg)
-            resultr = reflective_chain.invoke({"former_code": initcode})
-            resultg = generative_chain.invoke({"question": question, "reference": resultr})
-
-            solution_code = extract_code(resultg)
-            is_correct = run_tests(solution_code, test_code)
-            if is_correct:
-                correct_solutions2 += 1
-                false_tasks.pop(j)
-
-            total_tasks2 += 1
-        else:
-            continue
-
-success_rate2 = correct_solutions2 / total_tasks2 * 100
+success_rate2 = (correct_solutions2 / total_tasks2 * 100) if total_tasks2 else 0.0
 print("\n\n--------------\n\n")
-print(f"The one time reflection agent manages to solve {success_rate2:.2f}%({correct_solutions2}/{total_tasks2}) of the problems not solved in the previous step\n\n")
+print(f"The one time reflection agent manages to solve {success_rate2:.2f}% ({correct_solutions2}/{total_tasks2}) of the problems not solved in the previous step\n\n")
 print("What problems remain unsolved will be solved by the reflection loop agent")
 print("\n\n--------------\n\n")
 
+# Step 3: iterative reflection loop (multiple iterations per problem)
 total_tasks3 = 0
 correct_solutions3 = 0
 no_of_loops = 0
 
-# Reflection Loop (step 3)
 for task in dataset:
-
-    if total_tasks3 > 70 or false_tasks == []:
+    if not false_tasks:
         break
 
+    task_id = task["task_id"]
+    if task_id not in false_tasks:
+        continue
+
     question = task["prompt"]
-    reference_solution = task["canonical_solution"]
     test_code = task["test"]
     entry_point = task["entry_point"]
 
-    #Short term memory
-    short_term = []
+    print(f"\n Currently solving (iterative reflection loop): {task_id} ({entry_point})")
 
-    for k in false_tasks:
-        if task["task_id"] == k:
-            print(f"\n Currently solving: {task['task_id']} ({entry_point})")  # The problem we are currently at
-
-            resultg = generative_chain.invoke({"question": question, "reference": short_term})  # Llm's initial response
-
-            # Loop
-            for i in range(10):
-                solution_code = extract_code(resultg)  # Get the code from the llm's response
-                is_correct = run_tests(solution_code, test_code)  # Run the llm's response as a subprocess
-                if is_correct:
-                    correct_solutions3 += 1
-                    break
-                resultr = reflective_chain.invoke({"former_code": solution_code})  # Reflection analysis
-                no_of_loops += 1
-                short_term.append({"context": resultr})
-                resultg = generative_chain.invoke( {"question": question, "reference": short_term})  # The generative agent produces a new answer
-
-            total_tasks3 += 1
-        else:
-            continue
-
-success_rate3 = correct_solutions3 / total_tasks3 * 100
-print("\n\n--------------\n\n")
-print(f"The final agent managed to solve {success_rate3}({correct_solutions3}/{total_tasks3}) of the problems not solved in the previous step\n\n")
-print(f"Number of loops used by the agent in this step: {no_of_loops}\n\n")
-print("\n\n--------------\n\n")from langchain_core.prompts import ChatPromptTemplate
-from langchain_ollama import OllamaLLM
-from langchain_community.vectorstores import Chroma
-from langchain_community.embeddings import OllamaEmbeddings
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from chromadb.config import Settings
-import re
-import tempfile
-import subprocess
-from datasets import load_dataset
-
-
-# Load the full HumanEval dataset
-
-dataset = load_dataset("openai/openai_humaneval", split="test")
-
-# Each row in dataset is a dict like:
-# {
-#   "task_id": "HumanEval/0",
-#   "prompt": "...",               # problem statement and function signature
-#   "canonical_solution": "...",   # correct reference code
-#   "test": "...",                 # test code to evaluate solution
-#   "entry_point": "function_name" # name of the function to call
-# }
-
-
-# Initialize LLM and vector memory
-
-model = OllamaLLM(model="gemma3")
-embeddings = OllamaEmbeddings(model="mxbai-embed-large")
-vectorstore = Chroma(collection_name="llm_memory", embedding_function=embeddings, persist_directory="./chroma_db")
-
-text_splitter = RecursiveCharacterTextSplitter(chunk_size=600, chunk_overlap=100)
-
-# -------------------------------
-# Prompt templates
-# -------------------------------
-template1 = """
-You are a master in solving programming problems. You will be given a series of programming problems
-to solve and you will have to generate the code needed to solve the problem.
-
-User question:
-{question}
-
-Relevant past answers:
-{reference}
-"""
-
-template2 = """
-Follow these steps:  
-Step 1: Imagine you are reviewing this code as a senior engineer.  
-    - What would you critique or suggest improving?  
-    - Are there bugs, inefficiencies, or design flaws? 
-Step 2: Write down your suggestions for improvement.
-
-Here is the code the LLM generated before:
-{former_code}  
-"""
-
-#Template for problem solving without reflection
-template3 = """  
-You are a master in solving programming problems. You will be given a series of programming problems
-to solve and you will have to generate the code needed to solve the problem.
-
-User question:
-{question}
-"""
-
-generative_prompt = ChatPromptTemplate.from_template(template1)
-generative_chain = generative_prompt | model
-reflective_prompt = ChatPromptTemplate.from_template(template2)
-reflective_chain = reflective_prompt | model
-no_reflection_prompt = ChatPromptTemplate.from_template(template3)
-no_reflection_chain = no_reflection_prompt | model
-
-
-
-# -------------------------------
-# Memory helper functions
-# -------------------------------
-def add_to_memory(question, answer, taskid):
-    full_text = f"Question: {question}\nAnswer: {answer}, taskid: {taskid}"
-    chunks = text_splitter.split_text(full_text)
-    ids = [f"{taskid}_{i}" for i in range(len(chunks))]
-    vectorstore.add_texts(texts=chunks, metadatas=[{"question": question}] * len(chunks), ids=ids)
-
-def get_relevant_context(question, k=10):
-    results = vectorstore.similarity_search(question, k=k)
-    return "\n\n".join([r.page_content for r in results])
-
-def extract_code(text):
-    # Try fenced blocks first
-    fence = re.findall(r"```python(.*?)```", text, re.DOTALL)
-    if fence:
-        return fence[0].strip()
-
-    # Try generic fences
-    fence = re.findall(r"```(.*?)```", text, re.DOTALL)
-    if fence:
-        return fence[0].strip()
-
-    # Fallback: return whole text
-    return text.strip()
-
-def run_tests(solution_code, test_code):
-    # Create a safe temp file
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
-        # Write user's solution + tests
-        f.write(solution_code)
-        f.write("\n\n")
-        f.write(test_code)
-        f.flush()
-
-        try:
-            result = subprocess.run(
-                ["python3", f.name],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                timeout=5,
-            )
-            return result.returncode == 0
-        except subprocess.TimeoutExpired:
-            return False
-
-# -------------------------------
-# Iterate through HumanEval tasks
-# -------------------------------
-
-total_tasks = 0
-correct_solutions = 0
-false_tasks = []
-tasks_not_solved = 0
-#Asking the llm to solve a problem without reflection/context (step 1)
-for task in dataset:
-
-    if total_tasks > 70:
-        break
-
-    question = task["prompt"]
-    reference_solution = task["canonical_solution"]
-    test_code = task["test"]
-    entry_point = task["entry_point"]
-
-    print(f"\n Currently solving: {task['task_id']} ({entry_point})")  # The problem we are currently at
-    resultg = no_reflection_chain.invoke({"question": question})  # Llm's initial response
-    solution_code = extract_code(resultg)  # Get the code from the llm's response
-    is_correct = run_tests(solution_code, test_code)  # Run the llm's response as a subprocess
-    if is_correct:
-        correct_solutions += 1
+    # Start from last known response (from memo_1_reflection if present else memo)
+    if task_id in memo_1_reflection:
+        current_entry = memo_1_reflection[task_id]
     else:
-        false_tasks.append(task["task_id"])
-        tasks_not_solved += 1
-    total_tasks += 1
+        current_entry = memo[task_id]
 
-success_rate = correct_solutions / total_tasks * 100
-print("\n-----------")
-print(f"\n\nThe LLM's success rate without using reflection and context is {success_rate:.2f}% ({correct_solutions}/{total_tasks})\n\n")
-print("Any unsolved tasks from this step, will be taken to the one time reflection agent")
-print("\n\n---------------\n\n")
+    current_ans = current_entry["answer"]
+    current_code = current_entry["solution_code"]
+    current_stdout = current_entry.get("stdout", "")
+    current_stderr = current_entry.get("stderr", "")
 
-#One time reflection agent (step 2)
+    short_term = []  # list of reflection outputs (strings)
 
-total_tasks2 = 0
-correct_solutions2 = 0
+    solved = False
+    for i in range(10):
+        # run tests for current code (could be redundant on first iter but ensures latest logs)
+        test_result = run_tests(current_code, test_code)
+        if test_result["passed"]:
+            correct_solutions3 += 1
+            solved = True
+            if task_id in false_tasks:
+                false_tasks.remove(task_id)
+            break
 
-for task in dataset:
+        # get reflection using latest code & logs
+        reflection = reflective_chain.invoke({
+            "former_code": current_code,
+            "stdout": test_result["stdout"],
+            "stderr": test_result["stderr"],
+        })
+        no_of_loops += 1
+        short_term.append(reflection)
 
-    if total_tasks2 < 70 or false_tasks == []:
-        break
+        # Build a compact "reference" for the generative chain:
+        # join last few reflections and include previous solution and logs
+        reference_payload = "\n\n".join(short_term[-3:])  # last 3 reflections
+        reference_payload += "\n\nPrevious stdout:\n" + test_result["stdout"]
+        reference_payload += "\n\nPrevious stderr:\n" + test_result["stderr"]
+        # Ask the generative model for a new attempt
+        gen_resp = generative_chain.invoke({"question": question, "reference": reference_payload})
+        current_code = extract_code(gen_resp)
+        current_ans = gen_resp
 
-    question = task["prompt"]
-    reference_solution = task["canonical_solution"]
-    test_code = task["test"]
-    entry_point = task["entry_point"]
+        # Save progress in memo_1_reflection for potential future loops
+        memo_1_reflection[task_id] = {
+            "answer": current_ans,
+            "solution_code": current_code,
+            "stdout": test_result["stdout"],
+            "stderr": test_result["stderr"],
+        }
 
-    for j in false_tasks:
-        if task["task_id"] == j:
-            print(f"\n Currently solving: {task['task_id']} ({entry_point})")
-            resultg = no_reflection_chain.invoke({"question": question})
-            initcode = extract_code(resultg)
-            resultr = reflective_chain.invoke({"former_code": initcode})
-            resultg = generative_chain.invoke({"question": question, "reference": resultr})
+    if not solved:
+        pass
 
-            solution_code = extract_code(resultg)
-            is_correct = run_tests(solution_code, test_code)
-            if is_correct:
-                correct_solutions2 += 1
-                false_tasks.pop(j)
+    total_tasks3 += 1
 
-            total_tasks2 += 1
-        else:
-            continue
-
-success_rate2 = correct_solutions2 / total_tasks2 * 100
+success_rate3 = (correct_solutions3 / total_tasks3 * 100) if total_tasks3 else 0.0
 print("\n\n--------------\n\n")
-print(f"The one time reflection agent manages to solve {success_rate2:.2f}%({correct_solutions2}/{total_tasks2}) of the problems not solved in the previous step\n\n")
-print("What problems remain unsolved will be solved by the reflection loop agent")
-print("\n\n--------------\n\n")
-
-total_tasks3 = 0
-correct_solutions3 = 0
-no_of_loops = 0
-
-# Reflection Loop (step 3)
-for task in dataset:
-
-    if total_tasks3 > 70 or false_tasks == []:
-        break
-
-    question = task["prompt"]
-    reference_solution = task["canonical_solution"]
-    test_code = task["test"]
-    entry_point = task["entry_point"]
-
-    #Short term memory
-    short_term = []
-
-    for k in false_tasks:
-        if task["task_id"] == k:
-            print(f"\n Currently solving: {task['task_id']} ({entry_point})")  # The problem we are currently at
-
-            resultg = generative_chain.invoke({"question": question, "reference": short_term})  # Llm's initial response
-
-            # Loop
-            for i in range(10):
-                solution_code = extract_code(resultg)  # Get the code from the llm's response
-                is_correct = run_tests(solution_code, test_code)  # Run the llm's response as a subprocess
-                if is_correct:
-                    correct_solutions3 += 1
-                    break
-                resultr = reflective_chain.invoke({"former_code": solution_code})  # Reflection analysis
-                no_of_loops += 1
-                short_term.append({"context": resultr})
-                resultg = generative_chain.invoke( {"question": question, "reference": short_term})  # The generative agent produces a new answer
-
-            total_tasks3 += 1
-        else:
-            continue
-
-success_rate3 = correct_solutions3 / total_tasks3 * 100
-print("\n\n--------------\n\n")
-print(f"The final agent managed to solve {success_rate3}({correct_solutions3}/{total_tasks3}) of the problems not solved in the previous step\n\n")
-print(f"Number of loops used by the agent in this step: {no_of_loops}\n\n")
-print("\n\n--------------\n\n")from langchain_core.prompts import ChatPromptTemplate
-from langchain_ollama import OllamaLLM
-from langchain_community.vectorstores import Chroma
-from langchain_community.embeddings import OllamaEmbeddings
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from chromadb.config import Settings
-import re
-import tempfile
-import subprocess
-from datasets import load_dataset
-
-
-# Load the full HumanEval dataset
-
-dataset = load_dataset("openai/openai_humaneval", split="test")
-
-# Each row in dataset is a dict like:
-# {
-#   "task_id": "HumanEval/0",
-#   "prompt": "...",               # problem statement and function signature
-#   "canonical_solution": "...",   # correct reference code
-#   "test": "...",                 # test code to evaluate solution
-#   "entry_point": "function_name" # name of the function to call
-# }
-
-
-# Initialize LLM and vector memory
-
-model = OllamaLLM(model="gemma3")
-embeddings = OllamaEmbeddings(model="mxbai-embed-large")
-vectorstore = Chroma(collection_name="llm_memory", embedding_function=embeddings, persist_directory="./chroma_db")
-
-text_splitter = RecursiveCharacterTextSplitter(chunk_size=600, chunk_overlap=100)
-
-# -------------------------------
-# Prompt templates
-# -------------------------------
-template1 = """
-You are a master in solving programming problems. You will be given a series of programming problems
-to solve and you will have to generate the code needed to solve the problem.
-
-User question:
-{question}
-
-Relevant past answers:
-{reference}
-"""
-
-template2 = """
-Follow these steps:  
-Step 1: Imagine you are reviewing this code as a senior engineer.  
-    - What would you critique or suggest improving?  
-    - Are there bugs, inefficiencies, or design flaws? 
-Step 2: Write down your suggestions for improvement.
-
-Here is the code the LLM generated before:
-{former_code}  
-"""
-
-#Template for problem solving without reflection
-template3 = """  
-You are a master in solving programming problems. You will be given a series of programming problems
-to solve and you will have to generate the code needed to solve the problem.
-
-User question:
-{question}
-"""
-
-generative_prompt = ChatPromptTemplate.from_template(template1)
-generative_chain = generative_prompt | model
-reflective_prompt = ChatPromptTemplate.from_template(template2)
-reflective_chain = reflective_prompt | model
-no_reflection_prompt = ChatPromptTemplate.from_template(template3)
-no_reflection_chain = no_reflection_prompt | model
-
-
-
-# -------------------------------
-# Memory helper functions
-# -------------------------------
-def add_to_memory(question, answer, taskid):
-    full_text = f"Question: {question}\nAnswer: {answer}, taskid: {taskid}"
-    chunks = text_splitter.split_text(full_text)
-    ids = [f"{taskid}_{i}" for i in range(len(chunks))]
-    vectorstore.add_texts(texts=chunks, metadatas=[{"question": question}] * len(chunks), ids=ids)
-
-def get_relevant_context(question, k=10):
-    results = vectorstore.similarity_search(question, k=k)
-    return "\n\n".join([r.page_content for r in results])
-
-def extract_code(text):
-    # Try fenced blocks first
-    fence = re.findall(r"```python(.*?)```", text, re.DOTALL)
-    if fence:
-        return fence[0].strip()
-
-    # Try generic fences
-    fence = re.findall(r"```(.*?)```", text, re.DOTALL)
-    if fence:
-        return fence[0].strip()
-
-    # Fallback: return whole text
-    return text.strip()
-
-def run_tests(solution_code, test_code):
-    # Create a safe temp file
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
-        # Write user's solution + tests
-        f.write(solution_code)
-        f.write("\n\n")
-        f.write(test_code)
-        f.flush()
-
-        try:
-            result = subprocess.run(
-                ["python3", f.name],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                timeout=5,
-            )
-            return result.returncode == 0
-        except subprocess.TimeoutExpired:
-            return False
-
-# -------------------------------
-# Iterate through HumanEval tasks
-# -------------------------------
-
-total_tasks = 0
-correct_solutions = 0
-false_tasks = []
-tasks_not_solved = 0
-#Asking the llm to solve a problem without reflection/context (step 1)
-for task in dataset:
-
-    if total_tasks > 70:
-        break
-
-    question = task["prompt"]
-    reference_solution = task["canonical_solution"]
-    test_code = task["test"]
-    entry_point = task["entry_point"]
-
-    print(f"\n Currently solving: {task['task_id']} ({entry_point})")  # The problem we are currently at
-    resultg = no_reflection_chain.invoke({"question": question})  # Llm's initial response
-    solution_code = extract_code(resultg)  # Get the code from the llm's response
-    is_correct = run_tests(solution_code, test_code)  # Run the llm's response as a subprocess
-    if is_correct:
-        correct_solutions += 1
-    else:
-        false_tasks.append(task["task_id"])
-        tasks_not_solved += 1
-    total_tasks += 1
-
-success_rate = correct_solutions / total_tasks * 100
-print("\n-----------")
-print(f"\n\nThe LLM's success rate without using reflection and context is {success_rate:.2f}% ({correct_solutions}/{total_tasks})\n\n")
-print("Any unsolved tasks from this step, will be taken to the one time reflection agent")
-print("\n\n---------------\n\n")
-
-#One time reflection agent (step 2)
-
-total_tasks2 = 0
-correct_solutions2 = 0
-
-for task in dataset:
-
-    if total_tasks2 < 70 or false_tasks == []:
-        break
-
-    question = task["prompt"]
-    reference_solution = task["canonical_solution"]
-    test_code = task["test"]
-    entry_point = task["entry_point"]
-
-    for j in false_tasks:
-        if task["task_id"] == j:
-            print(f"\n Currently solving: {task['task_id']} ({entry_point})")
-            resultg = no_reflection_chain.invoke({"question": question})
-            initcode = extract_code(resultg)
-            resultr = reflective_chain.invoke({"former_code": initcode})
-            resultg = generative_chain.invoke({"question": question, "reference": resultr})
-
-            solution_code = extract_code(resultg)
-            is_correct = run_tests(solution_code, test_code)
-            if is_correct:
-                correct_solutions2 += 1
-                false_tasks.pop(j)
-
-            total_tasks2 += 1
-        else:
-            continue
-
-success_rate2 = correct_solutions2 / total_tasks2 * 100
-print("\n\n--------------\n\n")
-print(f"The one time reflection agent manages to solve {success_rate2:.2f}%({correct_solutions2}/{total_tasks2}) of the problems not solved in the previous step\n\n")
-print("What problems remain unsolved will be solved by the reflection loop agent")
-print("\n\n--------------\n\n")
-
-total_tasks3 = 0
-correct_solutions3 = 0
-no_of_loops = 0
-
-# Reflection Loop (step 3)
-for task in dataset:
-
-    if total_tasks3 > 70 or false_tasks == []:
-        break
-
-    question = task["prompt"]
-    reference_solution = task["canonical_solution"]
-    test_code = task["test"]
-    entry_point = task["entry_point"]
-
-    #Short term memory
-    short_term = []
-
-    for k in false_tasks:
-        if task["task_id"] == k:
-            print(f"\n Currently solving: {task['task_id']} ({entry_point})")  # The problem we are currently at
-
-            resultg = generative_chain.invoke({"question": question, "reference": short_term})  # Llm's initial response
-
-            # Loop
-            for i in range(10):
-                solution_code = extract_code(resultg)  # Get the code from the llm's response
-                is_correct = run_tests(solution_code, test_code)  # Run the llm's response as a subprocess
-                if is_correct:
-                    correct_solutions3 += 1
-                    break
-                resultr = reflective_chain.invoke({"former_code": solution_code})  # Reflection analysis
-                no_of_loops += 1
-                short_term.append({"context": resultr})
-                resultg = generative_chain.invoke( {"question": question, "reference": short_term})  # The generative agent produces a new answer
-
-            total_tasks3 += 1
-        else:
-            continue
-
-success_rate3 = correct_solutions3 / total_tasks3 * 100
-print("\n\n--------------\n\n")
-print(f"The final agent managed to solve {success_rate3}({correct_solutions3}/{total_tasks3}) of the problems not solved in the previous step\n\n")
+print(f"The final agent managed to solve {success_rate3:.2f}% ({correct_solutions3}/{total_tasks3}) of the problems attempted in the reflection loop\n\n")
 print(f"Number of loops used by the agent in this step: {no_of_loops}\n\n")
 print("\n\n--------------\n\n")
+
+
 
 
 
