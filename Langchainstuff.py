@@ -14,7 +14,6 @@ import matplotlib.pyplot as plt
 
 STATS_FILE = "stats.json" #JSON FILE
 
-
 # Create stats.json if missing
 if not os.path.exists(STATS_FILE):
     with open(STATS_FILE, "w", encoding="utf-8") as f:
@@ -314,8 +313,8 @@ for task in dataset:
     if not solved:
         save_steps(task_id)  # mark as not solved
 
-
 plot_step_changes("stats.json") #Showing plot
+
 
 
 
