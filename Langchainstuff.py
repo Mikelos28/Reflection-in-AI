@@ -14,6 +14,7 @@ import matplotlib.pyplot as plt
 
 STATS_FILE = "stats.json" #JSON FILE
 
+
 # Create stats.json if missing
 if not os.path.exists(STATS_FILE):
     with open(STATS_FILE, "w", encoding="utf-8") as f:
@@ -107,7 +108,7 @@ def plot_step_changes(json_path="stats.json"):
 
 dataset = load_dataset("openai/openai_humaneval", split="test") #Used dataset
 
-model = OllamaLLM(model="gemma3") #Model used
+model = OllamaLLM(model="llama3.2:1b") #Model used
 embeddings = OllamaEmbeddings(model="mxbai-embed-large") #Embeddings used
 vectorstore = Chroma(collection_name="llm_memory", embedding_function=embeddings, persist_directory="./chroma_db") #Vector Database
 
@@ -314,6 +315,7 @@ for task in dataset:
         save_steps(task_id)  # mark as not solved
 
 plot_step_changes("stats.json") #Showing plot
+
 
 
 
