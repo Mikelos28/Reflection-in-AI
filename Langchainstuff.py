@@ -14,12 +14,10 @@ import matplotlib.pyplot as plt
 
 STATS_FILE = "stats.json" #JSON FILE
 
-
 # Create stats.json if missing
 if not os.path.exists(STATS_FILE):
     with open(STATS_FILE, "w", encoding="utf-8") as f:
         json.dump([], f, indent=2)
-
 
 # JSON Logging
 def save_steps(problem_id, initial=None, reflection=None, final=None, solved_step=None):
@@ -315,6 +313,7 @@ for task in dataset:
         save_steps(task_id)  # mark as not solved
 
 plot_step_changes("stats.json") #Showing plot
+
 
 
 
