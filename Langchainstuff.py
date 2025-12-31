@@ -258,7 +258,6 @@ reflective_chain = reflective_prompt | model
 no_reflection_prompt = ChatPromptTemplate.from_template(template3)
 no_reflection_chain = no_reflection_prompt | model
 
-
 # Extract code from the LLM answers
 def extract_code(text):
     code = re.findall(r"```python(.*?)```", text, re.DOTALL)
@@ -368,7 +367,6 @@ for task2 in dataset:
         "stderr": entry["stderr"]
     })  #Reflection on the code generated in the previous step before answering in the current step
 
-
     # new solution
     question = task2["prompt"]
     improved_raw = generative_chain.invoke({"question": task2["prompt"], "reference": reflection}) #Answer using the reflection conclusions
@@ -470,10 +468,9 @@ for task5 in dataset:
         save_steps2(task_id)
 
 
-
-
 plot_step_changes("stats.json") #Showing plot for section 1
 plot_step_changes2("LongTerm.json") #showing plot for section 2
+
 
 
 
