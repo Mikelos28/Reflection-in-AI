@@ -20,15 +20,12 @@ def reset_stats_files():
     with open(STATS_FILE1, "w", encoding="utf-8") as f:
         json.dump([], f, indent=2)
 
-
-reset_stats_files()
+reset_stats_files() 
 
 # Create stats.json if missing
 if not os.path.exists(STATS_FILE1):
     with open(STATS_FILE1, "w", encoding="utf-8") as f:
         json.dump([], f, indent=2)
-
-
 
 # JSON Logging
 def save_steps(problem_id, initial=None, reflection=None, loop=None, long_term=None, reflection_with_solution=None, solved_step=None):
@@ -409,6 +406,7 @@ for task5 in dataset:
         save_steps(task_id)
 
 plot_step_changes("stats.json") #Showing plot
+
 
 
 
